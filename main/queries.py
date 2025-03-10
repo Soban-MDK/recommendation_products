@@ -17,6 +17,6 @@ WHERE si.is_recommendation_data_updated = false
 
 GET_EXISTING_RECOMMENDATIONS = """
 SELECT product_id, customer_id, mis_reporting_category, created_at, deleted_at 
-FROM recommendation_engine 
+FROM personalized_recommendations 
 WHERE deleted_at IS NULL;
 """

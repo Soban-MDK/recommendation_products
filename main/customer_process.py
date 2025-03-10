@@ -18,7 +18,7 @@ def get_sales_details_data():
     try:
         conn = connection_pos()
         data = read_data(conn, GET_SALES_DETAILS_DATA)
-        print(data)
+        # print(data)
 
         return data
     except Exception as e:
@@ -30,8 +30,14 @@ def data_processing(data):
     try:
         data['purchase_invoice_id'] = data['sales_invoice_id']
 
-        data = data.groupby(['product_id','customer_id', 'mis_reporting_category']).agg({'quantity':'sum','sales_invoice_id':'nunique','bill_date':'max','purchase_invoice_id':'last'}).reset_index()
-
+        data = data.groupby(['product_id', 'customer_id']).agg({
+            'quantity': 'sum',
+            'sales_invoice_id': 'nunique',
+            'bill_date': 'max',
+            'purchase_invoice_id': 'last',
+            'mis_reporting_category': 'first'  # or 'last', 'min', whatever suits your case
+        }).reset_index()
+        
         data = data.rename(columns={
             'quantity':'total_qty',
             'sales_invoice_id':'total_bill_count',
@@ -59,7 +65,6 @@ def update_recommendations(data):
                 and_(
                     RecommendationEngine.product_id == row['product_id'],
                     RecommendationEngine.customer_id == row['customer_id'],
-                    RecommendationEngine.mis_reporting_category == row['mis_reporting_category'],
                     RecommendationEngine.deleted_at.is_(None)
                 )
             ).first()
@@ -103,49 +108,6 @@ def update_recommendations(data):
         session.close()
 
 
-def update_recommendations_and_mark_processed():
-    try:
-        data = get_sales_details_data()
-        pos_string = conn_string_pos()
-        engine = create_engine(pos_string)
-        
-        processed_invoice_ids = data['sales_invoice_id'].unique().tolist()
-        
-        grouped_data = data_processing(data)
-        
-        try:
-            success = update_recommendations(grouped_data)
-        except Exception as e:
-            logger.warning(f"Efficient update failed, falling back to standard update: {e}")
-            logging()
-            return
-            # success = update_recommendations(grouped_data)
-            
-        if not success:
-            logger.error("Failed to update recommendations, skipping invoice status update")
-            return False
-            
-        with engine.connect() as connection:
-            invoice_ids_str = ','.join(str(id) for id in processed_invoice_ids)
-            
-            update_query = text(f"""
-                UPDATE sales_invoices 
-                SET is_recommendation_data_updated = true
-                WHERE id IN ({invoice_ids_str})
-            """)
-            
-            connection.execute(update_query)
-            connection.commit()
-            
-            logger.info(f"Successfully marked {len(processed_invoice_ids)} sales invoices as processed")
-            
-        return True
-        
-    except Exception as e:
-        logger.error(f"Error in update_recommendations_and_mark_processed: {e}")
-        return False
-
-
 def update_recommendations_efficient(data):
     try:
         pos_string = conn_string_pos()
@@ -154,6 +116,11 @@ def update_recommendations_efficient(data):
         session = Session()
 
         now = datetime.now()
+
+        # Only for dev env as it has some data wherein product_id or customer_id is null
+        required_cols = ["product_id", "customer_id"]
+        data = data.dropna(subset=required_cols)
+
         records = [
             {**row.to_dict(), "created_at": now, "updated_at": now}
             for _, row in data.iterrows()
@@ -162,7 +129,7 @@ def update_recommendations_efficient(data):
         stmt = insert(RecommendationEngine).values(records)
 
         stmt = stmt.on_conflict_do_update(
-            index_elements=["product_id", "customer_id", "mis_reporting_category"],  # Use columns directly
+            index_elements=["product_id", "customer_id"],  # Use columns directly
             set_={
                 "total_qty": RecommendationEngine.total_qty + stmt.excluded.total_qty,
                 "total_bill_count": RecommendationEngine.total_bill_count + stmt.excluded.total_bill_count,
@@ -179,6 +146,7 @@ def update_recommendations_efficient(data):
         logger.info("Successfully updated recommendation engine entries")
         return True
 
+
     except Exception as e:
         logger.error(f"Error updating recommendations: {e}")
         session.rollback()
@@ -186,3 +154,45 @@ def update_recommendations_efficient(data):
 
     finally:
         session.close()
+
+
+def update_recommendations_and_mark_processed():
+    try:
+        data = get_sales_details_data()
+        pos_string = conn_string_pos()
+        engine = create_engine(pos_string)
+        processed_invoice_ids = data['sales_invoice_id'].unique().tolist()
+        
+        grouped_data = data_processing(data)
+        if not data.empty:
+
+            try:
+                success = update_recommendations_efficient(grouped_data)
+            except Exception as e:
+                logger.warning(f"Efficient update failed {e}")
+                logging()
+                return
+                
+            if not success:
+                logger.error("Failed to update recommendations, skipping invoice status update")
+                return False
+                
+            with engine.connect() as connection:
+                invoice_ids_str = ','.join(str(id) for id in processed_invoice_ids)
+                
+                update_query = text(f"""
+                    UPDATE sales_invoices 
+                    SET is_recommendation_data_updated = true
+                    WHERE id IN ({invoice_ids_str})
+                """)
+                
+                connection.execute(update_query)
+                connection.commit()
+                
+                logger.info(f"Successfully marked {len(processed_invoice_ids)} sales invoices as processed")
+                
+        return True
+        
+    except Exception as e:
+        logger.error(f"Error in update_recommendations_and_mark_processed: {e}")
+        return False
